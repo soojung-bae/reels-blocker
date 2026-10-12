@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  ios-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for the iOS Simulator (no signing)
+        run: |
+          xcodebuild -version
+          xcodebuild build \
+            -project ios/ReelsBlocker.xcodeproj \
+            -target ReelsBlocker \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            CODE_SIGNING_ALLOWED=NO \
+            SYMROOT="$PWD/build"
+      - name: Check the blocking scripts are bundled
+        run: |
+          app=build/Debug-iphonesimulator/ReelsBlocker.app
+          ls "$app"
+          test -f "$app/instagram.user.js"
+          test -f "$app/facebook.user.js"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$app/Info.plist" | grep -x reelsblocker
