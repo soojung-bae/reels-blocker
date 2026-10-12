@@ -10,6 +10,7 @@ final class WebTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
 
     private var started = false
     private var backObservation: NSKeyValueObservation?
+    private var urlObservation: NSKeyValueObservation?
 
     init(site: Site) {
         self.site = site
@@ -45,6 +46,13 @@ final class WebTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
 
         backObservation = webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] webView, _ in
             DispatchQueue.main.async { self?.canGoBack = webView.canGoBack }
+        }
+
+        // `url` also changes on in-page navigation (history.pushState), so the
+        // script reacts the moment you swipe to another reel instead of polling.
+        urlObservation = webView.observe(\.url, options: [.new]) { webView, _ in
+            webView.evaluateJavaScript("window.__reelsBlockerCheck && window.__reelsBlockerCheck()",
+                                       in: nil, in: .defaultClient, completionHandler: nil)
         }
     }
 

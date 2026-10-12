@@ -78,6 +78,11 @@
   }
 
   // ---- Browser runtime ---------------------------------------------------------
+  // Performance notes: DOM work only touches nodes as they are added (inside the
+  // MutationObserver callback, so before they are painted), never rescans the
+  // page, never reads layout, and hiding is done with plain class selectors
+  // (no :has()). URL changes are pushed by the app (WKWebView `url` KVO), with
+  // a slow poll as a safety net.
 
   const KEY = 'reelsBlocker:';
   const store = {
@@ -85,19 +90,14 @@
     set(k, v) { try { sessionStorage.setItem(KEY + k, v); } catch (e) { /* ignore */ } },
   };
 
+  const SUGGESTED = /Suggested for you|Suggested posts|Sponsored/;
+  const REEL_LINK = 'a[href*="/reel/"]';
+
   const CSS = `
-    /* Reels tab (bottom bar / sidebar) and the Reels tab on profiles */
     a[href="/reels/"], a[href^="/reels/?"], a[href$="/reels/"] { display: none !important; }
-
-    /* Reels in the feed, on profiles and on Explore. Not in DMs, so a reel
-       someone sent you stays tappable. */
-    html.rb-hide-reels a[href*="/reel/"],
-    html.rb-hide-reels article:has(a[href*="/reel/"]) { display: none !important; }
-
+    html.rb-hide-reels ${REEL_LINK}, html.rb-hide-reels .rb-reel-post { display: none !important; }
     html.rb-explore-grid main a[href^="/p/"] { display: none !important; }
-
-    .rb-hidden { display: none !important; }
-
+    .rb-suggested { display: none !important; }
     #rb-toast {
       position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
       z-index: 2147483647; max-width: 86vw; padding: 10px 16px; border-radius: 20px;
@@ -107,11 +107,20 @@
     }
   `;
 
-  function injectStyle() {
-    const style = document.createElement('style');
-    style.id = 'rb-style';
-    style.textContent = CSS;
-    (document.head || document.documentElement).appendChild(style);
+  let pageType = null;
+  let reelId = null;
+  let reelStyle = null; // on a reel page: hides links to every *other* reel
+
+  function applyPage() {
+    const root = document.documentElement;
+    if (!root || !reelStyle) return;
+    const hide = pageType !== 'messages' && pageType !== 'reel';
+    const explore = SETTINGS.hideExploreGrid && pageType === 'explore';
+    if (root.classList.contains('rb-hide-reels') !== hide) root.classList.toggle('rb-hide-reels', hide);
+    if (root.classList.contains('rb-explore-grid') !== explore) root.classList.toggle('rb-explore-grid', explore);
+    const css = pageType === 'reel'
+      ? `${REEL_LINK}:not([href*="/${reelId}"]) { display: none !important; }` : '';
+    if (reelStyle.textContent !== css) reelStyle.textContent = css;
   }
 
   function toast(message) {
@@ -136,31 +145,22 @@
     location.replace(decision.to || store.get('lastNonReel') || '/direct/inbox/');
   }
 
-  function setPageClasses(type) {
-    const root = document.documentElement;
-    if (!root) return;
-    root.classList.toggle('rb-hide-reels', type !== 'messages' && type !== 'reel');
-    root.classList.toggle('rb-explore-grid', SETTINGS.hideExploreGrid && type === 'explore');
-  }
-
-  function currentType() {
-    return classifyPath(location.pathname).type;
-  }
-
   let prevPath = null;
   let lastHref = null;
 
   function onUrl() {
-    if (location.href === lastHref) return;
-    lastHref = location.href;
+    const href = location.href;
+    if (href === lastHref) return;
+    lastHref = href;
     const path = location.pathname;
-    const type = classifyPath(path).type;
+    const page = classifyPath(path);
 
     const decision = decideNavigation(prevPath, path, store.get('allowedReel'), SETTINGS);
     if (decision.action === 'block') return block(decision);
     if (decision.remember) store.set('allowedReel', decision.remember);
 
-    if (SETTINGS.followingFeedByDefault) {
+    // Only on a fresh page load: redirecting later would cost a full reload.
+    if (prevPath === null && SETTINGS.followingFeedByDefault) {
       const target = followingFeedUrl(path, location.search);
       const last = Number(store.get('followingRedirectAt') || 0);
       // Time guard: if Instagram strips the parameter, don't reload forever.
@@ -171,46 +171,61 @@
       }
     }
 
-    if (type !== 'reel') store.set('lastNonReel', location.href);
-    setPageClasses(type);
+    if (page.type !== 'reel') store.set('lastNonReel', href);
+    pageType = page.type;
+    reelId = page.id || null;
+    applyPage();
     prevPath = path;
-    scheduleSweep();
   }
 
-  // Things CSS can't express: hide links to *other* reels on a reel page
-  // ("more reels" suggestions) and hide suggested/sponsored posts.
-  function sweep() {
-    const cur = classifyPath(location.pathname);
-    // The site sometimes rewrites <html class>, so re-apply ours.
-    setPageClasses(cur.type);
-    if (cur.type === 'reel') {
-      document.querySelectorAll('a[href*="/reel/"]').forEach((a) => {
-        if (!a.getAttribute('href').includes('/' + cur.id)) a.classList.add('rb-hidden');
-      });
+  function markReelLink(a) {
+    const post = a.closest('article');
+    if (post) post.classList.add('rb-reel-post');
+  }
+
+  function checkSuggested(el, text) {
+    if (!SETTINGS.hideSuggestedPosts || !SUGGESTED.test(text)) return;
+    const post = el.closest('article');
+    if (post) post.classList.add('rb-suggested');
+  }
+
+  function scan(el) {
+    if (el.matches(REEL_LINK)) markReelLink(el);
+    if (el.firstElementChild) {
+      const links = el.querySelectorAll(REEL_LINK);
+      for (let i = 0; i < links.length; i++) markReelLink(links[i]);
     }
-    if (SETTINGS.hideSuggestedPosts) {
-      document.querySelectorAll('article:not([data-rb-checked])').forEach((article) => {
-        article.setAttribute('data-rb-checked', '');
-        const text = article.innerText || '';
-        if (/Suggested for you|Sponsored|Suggested posts/.test(text.slice(0, 400))) {
-          article.classList.add('rb-hidden');
-        }
-      });
+    if (!SETTINGS.hideSuggestedPosts) return;
+    if (el.closest('article')) {
+      checkSuggested(el, el.textContent);
+    } else {
+      const posts = el.getElementsByTagName('article');
+      for (let i = 0; i < posts.length; i++) checkSuggested(posts[i], posts[i].textContent);
     }
   }
 
-  let sweepTimer = null;
-  function scheduleSweep() {
-    if (sweepTimer) return;
-    sweepTimer = setTimeout(() => { sweepTimer = null; sweep(); }, 150);
+  function onMutations(records) {
+    for (let r = 0; r < records.length; r++) {
+      const record = records[r];
+      if (record.type === 'attributes') {
+        if (record.target.matches(REEL_LINK)) markReelLink(record.target);
+        continue;
+      }
+      const added = record.addedNodes;
+      for (let i = 0; i < added.length; i++) {
+        const node = added[i];
+        if (node.nodeType === 1) scan(node);
+        else if (node.nodeType === 3 && node.parentElement) checkSuggested(node.parentElement, node.nodeValue);
+      }
+    }
   }
 
   // Backstop for scrolling that doesn't change the URL: on a reel page, if a
   // container holding several videos scrolls past the first one, snap it back.
   function onScroll(e) {
-    if (currentType() !== 'reel') return;
+    if (pageType !== 'reel') return;
     const el = e.target === document ? document.scrollingElement : e.target;
-    if (!el || !el.querySelectorAll || el.querySelectorAll('video').length < 2) return;
+    if (!el || !el.getElementsByTagName || el.getElementsByTagName('video').length < 2) return;
     if (el.scrollTop > window.innerHeight * 0.6) {
       el.scrollTop = 0;
       toast('One reel only');
@@ -226,18 +241,28 @@
     mo.observe(document, { childList: true });
   }
 
+  window.__reelsBlockerCheck = onUrl; // called by the app on every URL change
   onUrl();
   whenRoot(() => {
-    injectStyle();
-    setPageClasses(currentType());
-    new MutationObserver(scheduleSweep).observe(document.documentElement, { childList: true, subtree: true });
+    const root = document.documentElement;
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    reelStyle = document.createElement('style');
+    (document.head || root).append(style, reelStyle);
+    applyPage();
+    scan(root);
+    new MutationObserver(onMutations).observe(root, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['href'],
+    });
+    // The site sometimes rewrites <html class>; put ours back.
+    new MutationObserver(applyPage).observe(root, { attributes: true, attributeFilter: ['class'] });
   });
   const pending = store.get('toast');
   if (pending) {
     store.set('toast', '');
     toast(pending);
   }
-  setInterval(onUrl, 200);
+  setInterval(onUrl, 1000);
   window.addEventListener('popstate', onUrl);
   document.addEventListener('scroll', onScroll, { capture: true, passive: true });
 })();

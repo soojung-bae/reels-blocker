@@ -82,6 +82,11 @@
   }
 
   // ---- Browser runtime ---------------------------------------------------------
+  // Performance notes: DOM work only touches nodes as they are added (inside the
+  // MutationObserver callback, so before they are painted), never rescans the
+  // page, never reads layout, and hiding is done with plain class selectors
+  // (no :has()). URL changes are pushed by the app (WKWebView `url` KVO), with
+  // a slow poll as a safety net.
 
   const KEY = 'reelsBlocker:';
   const store = {
@@ -89,22 +94,22 @@
     set(k, v) { try { sessionStorage.setItem(KEY + k, v); } catch (e) { /* ignore */ } },
   };
 
+  const REEL_LINK = 'a[href*="/reel/"]';
+  const FEED_UNIT = '[role="article"], [data-pagelet^="FeedUnit"]';
+  const REELS_WORD = /Reels|Short videos/i;
+  const REELS_HEADING = /^\s*(Reels|Reels and short videos|Short videos)\s*$/i;
+  const NOT_A_SHELF = '.rb-reel-shelf, nav, [role="navigation"], [role="tablist"], [role="banner"]';
+
   const CSS = `
-    /* Reels / Video tab links */
     a[href="/reel/"], a[href^="/reel/?"], a[href="/reels/"], a[href$="/reels/"],
     a[href*="sk=reels_tab"] { display: none !important; }
     html.rb-block-watch a[href="/watch/"], html.rb-block-watch a[href^="/watch/?"]:not([href*="v="]),
     html.rb-block-watch a[href="/watch"] { display: none !important; }
-
-    /* Reels in the feed and on profiles (not in Messages). */
-    html.rb-hide-reels a[href*="/reel/"],
-    html.rb-hide-reels [role="article"]:has(a[href*="/reel/"]),
-    html.rb-hide-reels [data-pagelet^="FeedUnit"]:has(a[href*="/reel/"]),
+    html.rb-hide-reels ${REEL_LINK},
+    html.rb-hide-reels .rb-reel-post,
+    html.rb-hide-reels .rb-reel-shelf,
     html.rb-hide-reels [aria-label="Reels"],
     html.rb-hide-reels [aria-label="Reels and short videos"] { display: none !important; }
-
-    .rb-hidden { display: none !important; }
-
     #rb-toast {
       position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
       z-index: 2147483647; max-width: 86vw; padding: 10px 16px; border-radius: 20px;
@@ -114,11 +119,23 @@
     }
   `;
 
-  function injectStyle() {
-    const style = document.createElement('style');
-    style.id = 'rb-style';
-    style.textContent = CSS;
-    (document.head || document.documentElement).appendChild(style);
+  const SHELF_MAX_TEXT = 1500;
+
+  let pageType = null;
+  let reelId = null;
+  let shelves = 0; // how many sections are marked, so the growth check costs nothing until then
+  let reelStyle = null; // on a reel page: hides links to every *other* reel
+
+  function applyPage() {
+    const root = document.documentElement;
+    if (!root || !reelStyle) return;
+    const hide = pageType !== 'messages' && pageType !== 'reel';
+    const watch = SETTINGS.blockWatchFeed;
+    if (root.classList.contains('rb-hide-reels') !== hide) root.classList.toggle('rb-hide-reels', hide);
+    if (root.classList.contains('rb-block-watch') !== watch) root.classList.toggle('rb-block-watch', watch);
+    const css = pageType === 'reel'
+      ? `${REEL_LINK}:not([href*="/${reelId}"]) { display: none !important; }` : '';
+    if (reelStyle.textContent !== css) reelStyle.textContent = css;
   }
 
   function toast(message) {
@@ -143,31 +160,22 @@
     location.replace(decision.to || store.get('lastNonReel') || '/');
   }
 
-  function setPageClasses(type) {
-    const root = document.documentElement;
-    if (!root) return;
-    root.classList.toggle('rb-hide-reels', type !== 'messages' && type !== 'reel');
-    root.classList.toggle('rb-block-watch', SETTINGS.blockWatchFeed);
-  }
-
-  function currentType() {
-    return classifyPath(location.pathname, location.search).type;
-  }
-
   let prevPath = null;
   let lastHref = null;
 
   function onUrl() {
-    if (location.href === lastHref) return;
-    lastHref = location.href;
+    const href = location.href;
+    if (href === lastHref) return;
+    lastHref = href;
     const path = location.pathname;
-    const type = classifyPath(path, location.search).type;
+    const page = classifyPath(path, location.search);
 
     const decision = decideNavigation(prevPath, path, location.search, store.get('allowedReel'), SETTINGS);
     if (decision.action === 'block') return block(decision);
     if (decision.remember) store.set('allowedReel', decision.remember);
 
-    if (SETTINGS.friendsFeedByDefault) {
+    // Only on a fresh page load: redirecting later would cost a full reload.
+    if (prevPath === null && SETTINGS.friendsFeedByDefault) {
       const target = friendsFeedUrl(path, location.search);
       const last = Number(store.get('friendsRedirectAt') || 0);
       // Time guard: if Facebook strips the parameters, don't reload forever.
@@ -178,72 +186,84 @@
       }
     }
 
-    if (type !== 'reel') store.set('lastNonReel', location.href);
-    setPageClasses(type);
+    if (page.type !== 'reel') store.set('lastNonReel', href);
+    pageType = page.type;
+    reelId = page.id || null;
+    applyPage();
     prevPath = path;
-    scheduleSweep();
   }
 
-  const REELS_HEADING = /^(Reels|Reels and short videos|Short videos)$/i;
-
-  // The mobile site (m.facebook.com) uses few links or labels, so also look for
-  // feed sections titled "Reels" and hide the whole section.
-  function hideReelsShelves() {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-      acceptNode: (n) => (REELS_HEADING.test(n.nodeValue.trim()) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
-    });
-    const hits = [];
-    while (walker.nextNode()) hits.push(walker.currentNode.parentElement);
-    hits.forEach((heading) => {
-      if (!heading || heading.closest('.rb-hidden, a, nav, [role="navigation"], [role="tablist"], [role="tab"], [role="banner"]')) return;
-      const shelf = findSection(heading);
-      if (shelf) shelf.classList.add('rb-hidden');
-    });
+  function markReelLink(a) {
+    const post = a.closest(FEED_UNIT);
+    if (post) post.classList.add('rb-reel-post');
   }
 
-  // Climb to the ancestor that is one item in a list of siblings (a feed unit),
-  // and only accept it if it looks like a thumbnail shelf of sensible size.
-  function findSection(el) {
-    for (let i = 0; i < 14 && el && el.parentElement && el.parentElement !== document.body; i++) {
-      const parent = el.parentElement;
-      if (parent.children.length >= 3) {
-        const h = el.offsetHeight;
-        const media = el.querySelectorAll('img, video').length;
-        const ok = h > 80 && h < window.innerHeight * 1.5 && media >= 2 &&
-          !el.querySelector('nav, [role="navigation"], [role="feed"], [role="main"]');
-        return ok ? el : null;
+  // The mobile site (m.facebook.com) has few links or labels, so also find feed
+  // sections titled "Reels": climb from the title to the ancestor that is one
+  // item in a list (a feed unit) and mark it, if it's small enough to be a shelf.
+  function markShelf(heading) {
+    if (!heading || heading.closest(NOT_A_SHELF)) return;
+    let el = heading;
+    for (let i = 0; i < 14 && el.parentElement && el.parentElement !== document.body; i++) {
+      if (el.parentElement.childElementCount >= 3) {
+        if (el.textContent.length < SHELF_MAX_TEXT && !el.querySelector('nav, [role="navigation"], [role="feed"], [role="main"]')) {
+          el.classList.add('rb-reel-shelf');
+          shelves++;
+        }
+        return;
       }
-      el = parent;
-    }
-    return null;
-  }
-
-  function sweep() {
-    const cur = classifyPath(location.pathname, location.search);
-    // The site sometimes rewrites <html class>, so re-apply ours.
-    setPageClasses(cur.type);
-    if (cur.type === 'reel') {
-      // Hide links to *other* reels on a reel page.
-      document.querySelectorAll('a[href*="/reel/"]').forEach((a) => {
-        if (!a.getAttribute('href').includes('/' + cur.id)) a.classList.add('rb-hidden');
-      });
-    } else if (cur.type !== 'messages' && document.body) {
-      hideReelsShelves();
+      el = el.parentElement;
     }
   }
 
-  let sweepTimer = null;
-  function scheduleSweep() {
-    if (sweepTimer) return;
-    sweepTimer = setTimeout(() => { sweepTimer = null; sweep(); }, 200);
+  function scanText(root) {
+    if (!REELS_WORD.test(root.textContent)) return; // fast path: nearly always
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (REELS_HEADING.test(n.nodeValue)) markShelf(n.parentElement);
+    }
+  }
+
+  function scan(el) {
+    if (el.matches(REEL_LINK)) markReelLink(el);
+    if (el.firstElementChild) {
+      const links = el.querySelectorAll(REEL_LINK);
+      for (let i = 0; i < links.length; i++) markReelLink(links[i]);
+    }
+    scanText(el);
+  }
+
+  function onMutations(records) {
+    for (let r = 0; r < records.length; r++) {
+      const record = records[r];
+      if (record.type === 'attributes') {
+        if (record.target.matches(REEL_LINK)) markReelLink(record.target);
+        continue;
+      }
+      const added = record.addedNodes;
+      if (shelves && added.length) {
+        // A title can arrive before the rest of the page; if what we marked grows
+        // into something big (e.g. the whole feed), it wasn't a Reels section.
+        const shelf = record.target.closest && record.target.closest('.rb-reel-shelf');
+        if (shelf && shelf.textContent.length >= SHELF_MAX_TEXT) {
+          shelf.classList.remove('rb-reel-shelf');
+          shelves--;
+        }
+      }
+      for (let i = 0; i < added.length; i++) {
+        const node = added[i];
+        if (node.nodeType === 1) scan(node);
+        else if (node.nodeType === 3 && REELS_HEADING.test(node.nodeValue)) markShelf(node.parentElement);
+      }
+    }
   }
 
   // Backstop for scrolling that doesn't change the URL: on a reel page, if a
   // container holding several videos scrolls past the first one, snap it back.
   function onScroll(e) {
-    if (currentType() !== 'reel') return;
+    if (pageType !== 'reel') return;
     const el = e.target === document ? document.scrollingElement : e.target;
-    if (!el || !el.querySelectorAll || el.querySelectorAll('video').length < 2) return;
+    if (!el || !el.getElementsByTagName || el.getElementsByTagName('video').length < 2) return;
     if (el.scrollTop > window.innerHeight * 0.6) {
       el.scrollTop = 0;
       toast('One reel only');
@@ -259,18 +279,28 @@
     mo.observe(document, { childList: true });
   }
 
+  window.__reelsBlockerCheck = onUrl; // called by the app on every URL change
   onUrl();
   whenRoot(() => {
-    injectStyle();
-    setPageClasses(currentType());
-    new MutationObserver(scheduleSweep).observe(document.documentElement, { childList: true, subtree: true });
+    const root = document.documentElement;
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    reelStyle = document.createElement('style');
+    (document.head || root).append(style, reelStyle);
+    applyPage();
+    scan(root);
+    new MutationObserver(onMutations).observe(root, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['href'],
+    });
+    // The site sometimes rewrites <html class>; put ours back.
+    new MutationObserver(applyPage).observe(root, { attributes: true, attributeFilter: ['class'] });
   });
   const pending = store.get('toast');
   if (pending) {
     store.set('toast', '');
     toast(pending);
   }
-  setInterval(onUrl, 200);
+  setInterval(onUrl, 1000);
   window.addEventListener('popstate', onUrl);
   document.addEventListener('scroll', onScroll, { capture: true, passive: true });
 })();

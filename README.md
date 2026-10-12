@@ -56,7 +56,7 @@ Each script has a `SETTINGS` block at the top. Edit it and press Run in Xcode ag
 | Setting | Default | What it does |
 |---|---|---|
 | `reelsOnlyFromMessages` | `true` | Single reels open only from DMs or a pasted/shared link. Set `false` to also allow them from profiles. |
-| `followingFeedByDefault` (IG) / `friendsFeedByDefault` (FB) | `true` | Open the Following / Friends feed instead of the algorithmic one. |
+| `followingFeedByDefault` (IG) / `friendsFeedByDefault` (FB) | `true` | Open the Following / Friends feed instead of the algorithmic one. The app's start page and Home button already go there; change `home` in `ios/ReelsBlocker/Site.swift` too if you turn this off. |
 | `hideSuggestedPosts` (IG) | `true` | Hide "Suggested for you" and "Sponsored" posts. |
 | `hideExploreGrid` (IG) | `true` | Hide the post grid on Explore; search still works. |
 | `blockWatchFeed` (FB) | `true` | Block the Video feed; single shared videos still open. |
