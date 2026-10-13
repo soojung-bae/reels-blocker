@@ -22,6 +22,11 @@ final class WebTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
         // Look like mobile Safari so the sites serve their normal mobile pages.
         config.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
 
+        // Tells the script the app pushes URL changes, so it can poll less.
+        config.userContentController.addUserScript(
+            WKUserScript(source: "window.__reelsBlockerNative = true;",
+                         injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .defaultClient))
+
         if let url = Bundle.main.url(forResource: site.scriptName, withExtension: "js"),
            let source = try? String(contentsOf: url, encoding: .utf8) {
             let script = WKUserScript(source: source,

@@ -16,22 +16,50 @@ jobs:
 
   ios-build:
     runs-on: macos-15
+    permissions:
+      contents: write # to attach the .ipa to the "latest" release
     steps:
       - uses: actions/checkout@v4
-      - name: Build for the iOS Simulator (no signing)
+
+      - name: Build for iPhone (unsigned; AltStore/Sideloadly sign it on install)
         run: |
           xcodebuild -version
           xcodebuild build \
             -project ios/ReelsBlocker.xcodeproj \
             -target ReelsBlocker \
-            -configuration Debug \
-            -sdk iphonesimulator \
+            -configuration Release \
+            -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$PWD/build"
+
       - name: Check the blocking scripts are bundled
         run: |
-          app=build/Debug-iphonesimulator/ReelsBlocker.app
+          app=build/Release-iphoneos/ReelsBlocker.app
           ls "$app"
           test -f "$app/instagram.user.js"
           test -f "$app/facebook.user.js"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$app/Info.plist" | grep -x reelsblocker
+
+      - name: Package ReelsBlocker.ipa
+        run: |
+          mkdir Payload
+          cp -R build/Release-iphoneos/ReelsBlocker.app Payload/
+          zip -qry ReelsBlocker.ipa Payload
+          ls -lh ReelsBlocker.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReelsBlocker-ipa
+          path: ReelsBlocker.ipa
+
+      - name: Attach to the "latest" release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --prerelease --target "$GITHUB_SHA" \
+              --title "Latest build" \
+              --notes "ReelsBlocker.ipa built from the newest push. Install it with AltStore or Sideloadly (see README)."
+          fi
+          gh release upload latest ReelsBlocker.ipa --clobber

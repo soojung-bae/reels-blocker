@@ -7,6 +7,7 @@
 // @run-at       document-start
 // @inject-into  content
 // @grant        none
+// @noframes
 // ==/UserScript==
 
 (function () {
@@ -85,8 +86,8 @@
   // Performance notes: DOM work only touches nodes as they are added (inside the
   // MutationObserver callback, so before they are painted), never rescans the
   // page, never reads layout, and hiding is done with plain class selectors
-  // (no :has()). URL changes are pushed by the app (WKWebView `url` KVO), with
-  // a slow poll as a safety net.
+  // (no :has()). URL changes are pushed by the app (WKWebView `url` KVO) or
+  // come from the Navigation API where available, with polling as a backup.
 
   const KEY = 'reelsBlocker:';
   const store = {
@@ -300,7 +301,10 @@
     store.set('toast', '');
     toast(pending);
   }
-  setInterval(onUrl, 1000);
+  // In the app, URL changes are pushed instantly, so polling is only a safety
+  // net. In Safari (Userscripts) there is no push, so poll faster.
+  setInterval(onUrl, window.__reelsBlockerNative ? 1000 : 250);
   window.addEventListener('popstate', onUrl);
+  if (window.navigation) window.navigation.addEventListener('currententrychange', onUrl);
   document.addEventListener('scroll', onScroll, { capture: true, passive: true });
 })();
